@@ -83,7 +83,23 @@ func readJWTToken(path string) (string, error) {
 	return string(bytes.TrimSpace(data)), nil
 }
 
-func (p *Provider) getMountInfo(mountName, token string) (string, string, error) {
+func normalizeSecretPath(secretPath string) string {
+	// Remove initial "/"
+	r1 := regexp.MustCompile(`^/`)
+	if r1.Match([]byte(secretPath)) {
+		secretPath = strings.Replace(secretPath, "/", "", 1)
+	}
+	// Add trailing "/"
+	r2 := regexp.MustCompile(`/$`)
+	if !r2.Match([]byte(secretPath)) {
+		secretPath = secretPath + "/"
+	}
+	return secretPath
+}
+
+func (p *Provider) getMountInfo(secretPath string, token string) (string, string, error) {
+	secretPath = normalizeSecretPath(secretPath)
+
 	client, err := p.createHTTPClient()
 	if err != nil {
 		return "", "", err
@@ -120,22 +136,49 @@ func (p *Provider) getMountInfo(mountName, token string) (string, string, error)
 		return "", "", err
 	}
 
-	return mount.Data[mountName+"/"].Type, mount.Data[mountName+"/"].Options["version"], nil
+	// Database
+	db := regexp.MustCompile(`/creds/.+$`)
+	if db.MatchString(secretPath) {
+		secretPath = regexp.MustCompile(`creds/.+$`).ReplaceAllString(secretPath, "$1")
+		return mount.Data[secretPath].Type, mount.Data[secretPath].Options["version"], nil
+	}
+
+	// KV
+	secretPathSplit := strings.Split(secretPath, "/")
+	secretName := secretPathSplit[0] + "/"
+	if mount.Data[secretName].Type != "" {
+		return mount.Data[secretName].Type, mount.Data[secretName].Options["version"], nil
+	}
+
+	return "", "", fmt.Errorf("failed to get infos about secret path")
 }
 
-func generateSecretEndpoint(vaultAddress string, secretMountType string, secretMountVersion string, secretPrefix string, secretSuffix string, secretVersion string) (string, error) {
+func generateSecretEndpoint(vaultAddress string, secretMountType string, secretMountVersion string, secretPath string, secretVersion string) (string, error) {
 	addr := ""
-	errMessage := fmt.Errorf("Only mount types KV/1 and KV/2 are supported")
+	errMessage := fmt.Errorf("Only mount types KV/1, KV/2 and database are supported")
 	switch secretMountType {
 	case "kv":
+		// add initial "/" if not present
+		r1 := regexp.MustCompile(`^/`)
+		if !r1.Match([]byte(secretPath)) {
+			secretPath = "/" + secretPath
+		}
+		s := regexp.MustCompile("/+").Split(secretPath, 3)
+		if len(s) < 3 {
+			return "", fmt.Errorf("unable to parse secret path %q", secretPath)
+		}
+		secretPrefix := s[1]
+		secretSuffix := s[2]
 		switch secretMountVersion {
 		case "1":
 			addr = vaultAddress + "/v1/" + secretPrefix + "/" + secretSuffix
 		case "2":
 			addr = vaultAddress + "/v1/" + secretPrefix + "/data/" + secretSuffix + "?version=" + secretVersion
 		default:
-			return "", errMessage
+			return "", fmt.Errorf("Unable to generate secret endpoint for KV")
 		}
+	case "database":
+		addr = vaultAddress + "/v1/" + secretPath
 	default:
 		return "", errMessage
 	}
@@ -230,19 +273,12 @@ func (p *Provider) getSecret(token string, secretPath string, secretName string,
 		secretVersion = "0"
 	}
 
-	s := regexp.MustCompile("/+").Split(secretPath, 3)
-	if len(s) < 3 {
-		return "", fmt.Errorf("unable to parse secret path %q", secretPath)
-	}
-	secretPrefix := s[1]
-	secretSuffix := s[2]
-
-	secretMountType, secretMountVersion, err := p.getMountInfo(secretPrefix, token)
+	secretMountType, secretMountVersion, err := p.getMountInfo(secretPath, token)
 	if err != nil {
 		return "", err
 	}
 
-	addr, err := generateSecretEndpoint(p.VaultAddress, secretMountType, secretMountVersion, secretPrefix, secretSuffix, secretVersion)
+	addr, err := generateSecretEndpoint(p.VaultAddress, secretMountType, secretMountVersion, secretPath, secretVersion)
 	if err != nil {
 		return "", err
 	}
@@ -291,6 +327,14 @@ func (p *Provider) getSecret(token string, secretPath string, secretName string,
 			}
 			return d.Data.Data[secretName], nil
 		}
+	case "database":
+		var d struct {
+			Data map[string]string `json:"data"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
+			return "", errors.Wrapf(err, "failed to read body")
+		}
+		return d.Data[secretName], nil
 	}
 
 	return "", fmt.Errorf("failed to get secret value")
