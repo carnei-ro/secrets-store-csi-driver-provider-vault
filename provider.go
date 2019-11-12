@@ -65,6 +65,11 @@ type Mount struct {
 	Options map[string]string `json:"options"`
 }
 
+type DatabaseCredentials struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
 // NewProvider creates a new provider HashiCorp Vault.
 func NewProvider() (*Provider, error) {
 	klog.V(2).Infof("NewVaultProvider")
@@ -258,12 +263,12 @@ func (p *Provider) login(jwt string, roleName string) (string, error) {
 	return s.Auth.ClientToken, nil
 }
 
-func (p *Provider) getSecret(token string, secretPath string, secretName string, secretVersion string) (string, error) {
+func (p *Provider) getSecret(token string, secretPath string, secretName string, secretVersion string) (string, string, error) {
 	klog.V(2).Infof("vault: getting secrets from vault.....")
 
 	client, err := p.createHTTPClient()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	if secretVersion == "" {
@@ -272,24 +277,24 @@ func (p *Provider) getSecret(token string, secretPath string, secretName string,
 
 	secretMountType, secretMountVersion, err := p.getMountInfo(secretPath, token)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	addr, err := generateSecretEndpoint(p.VaultAddress, secretMountType, secretMountVersion, secretPath, secretName, secretVersion)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	req, err := http.NewRequest(http.MethodGet, addr, nil)
 	// Set vault token.
 	req.Header.Set("X-Vault-Token", token)
 	if err != nil {
-		return "", errors.Wrapf(err, "couldn't generate request")
+		return "", "", errors.Wrapf(err, "couldn't generate request")
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", errors.Wrapf(err, "couldn't get secret")
+		return "", "", errors.Wrapf(err, "couldn't get secret")
 	}
 
 	defer resp.Body.Close()
@@ -297,7 +302,7 @@ func (p *Provider) getSecret(token string, secretPath string, secretName string,
 	if resp.StatusCode != 200 {
 		var b bytes.Buffer
 		io.Copy(&b, resp.Body)
-		return "", fmt.Errorf("failed to get successful response: %#v, %s",
+		return "", "", fmt.Errorf("failed to get successful response: %#v, %s",
 			resp, b.String())
 	}
 
@@ -309,9 +314,9 @@ func (p *Provider) getSecret(token string, secretPath string, secretName string,
 				Data map[string]string `json:"data"`
 			}
 			if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
-				return "", errors.Wrapf(err, "failed to read body")
+				return "", "", errors.Wrapf(err, "failed to read body")
 			}
-			return d.Data[secretName], nil
+			return d.Data[secretName], secretMountType, nil
 
 		case "2":
 			var d struct {
@@ -320,20 +325,24 @@ func (p *Provider) getSecret(token string, secretPath string, secretName string,
 				} `json:"data"`
 			}
 			if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
-				return "", errors.Wrapf(err, "failed to read body")
+				return "", "", errors.Wrapf(err, "failed to read body")
 			}
-			return d.Data.Data[secretName], nil
+			return d.Data.Data[secretName], secretMountType, nil
 		}
 	case "database":
 		var d struct {
-			Data map[string]string `json:"data"`
+			Credentials DatabaseCredentials `json:"data"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
-			return "", errors.Wrapf(err, "failed to read body")
+			return "", "", errors.Wrapf(err, "failed to read body")
 		}
-		return d.Data["username"]+"\n"+d.Data["password"], nil
+		credentials_json, err := json.Marshal(d.Credentials)
+		if err != nil {
+			return "", "", errors.Wrapf(err, "failed to wrap credentials")
+		}
+		return string(credentials_json), secretMountType, nil
 	}
-	return "", fmt.Errorf("failed to get secret value")
+	return "", "", fmt.Errorf("failed to get secret value")
 }
 
 func (p *Provider) getRootCAsPools() (*x509.CertPool, error) {
@@ -472,39 +481,57 @@ func (p *Provider) MountSecretsStoreObjectContent(ctx context.Context, attrib ma
 	}
 
 	for _, keyValueObject := range keyValueObjects {
-		content, err := p.GetKeyValueObjectContent(ctx, keyValueObject.ObjectPath, keyValueObject.ObjectName, keyValueObject.ObjectVersion)
+		content, secretMountType, err := p.GetKeyValueObjectContent(ctx, keyValueObject.ObjectPath, keyValueObject.ObjectName, keyValueObject.ObjectVersion)
 		if err != nil {
 			return err
 		}
-		objectContent := []byte(content)
-		if err := ioutil.WriteFile(path.Join(targetPath, keyValueObject.ObjectName), objectContent, permission); err != nil {
-			return errors.Wrapf(err, "secrets-store csi driver failed to write %s at %s", keyValueObject.ObjectName, targetPath)
+		switch secretMountType {
+		case "kv":
+			objectContent := []byte(content)
+			if err := ioutil.WriteFile(path.Join(targetPath, keyValueObject.ObjectName), objectContent, permission); err != nil {
+				return errors.Wrapf(err, "secrets-store csi driver failed to write %s at %s", keyValueObject.ObjectName, targetPath)
+			}
+			klog.V(0).Infof("secrets-store csi driver wrote %s at %s", keyValueObject.ObjectName, targetPath)
+		case "database":
+			var dbcreds DatabaseCredentials
+			if err := json.Unmarshal([]byte(content), &dbcreds); err != nil {
+				return errors.Wrapf(err, "secrets-store csi driver failed to write %s at %s", keyValueObject.ObjectName, targetPath)
+			}
+			if err := ioutil.WriteFile(path.Join(targetPath, keyValueObject.ObjectName+"_username"), []byte(dbcreds.Username), permission); err != nil {
+				return errors.Wrapf(err, "secrets-store csi driver failed to write %s at %s", keyValueObject.ObjectName+"_username", targetPath)
+			}
+			klog.V(0).Infof("secrets-store csi driver wrote %s at %s", keyValueObject.ObjectName+"_username", targetPath)
+			if err := ioutil.WriteFile(path.Join(targetPath, keyValueObject.ObjectName+"_password"), []byte(dbcreds.Password), permission); err != nil {
+				return errors.Wrapf(err, "secrets-store csi driver failed to write %s at %s", keyValueObject.ObjectName+"_password", targetPath)
+			}
+			klog.V(0).Infof("secrets-store csi driver wrote %s at %s", keyValueObject.ObjectName+"_password", targetPath)
+		default:
+			return fmt.Errorf("secrets-store csi driver failed to write %s at %s", keyValueObject.ObjectName, targetPath)
 		}
-		klog.V(0).Infof("secrets-store csi driver wrote %s at %s", keyValueObject.ObjectName, targetPath)
 	}
 
 	return nil
 }
 
 // GetKeyValueObjectContent get content of the vault object
-func (p *Provider) GetKeyValueObjectContent(ctx context.Context, objectPath string, objectName string, objectVersion string) (content string, err error) {
+func (p *Provider) GetKeyValueObjectContent(ctx context.Context, objectPath string, objectName string, objectVersion string) (content string, secretMountType string, err error) {
 	// Read the jwt token from disk
 	jwt, err := readJWTToken(p.KubernetesServiceAccountPath)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	// Authenticate to vault using the jwt token
 	token, err := p.login(jwt, p.VaultRole)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	// Get Secret
-	value, err := p.getSecret(token, objectPath, objectName, objectVersion)
+	value, secretMountType, err := p.getSecret(token, objectPath, objectName, objectVersion)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
-	return value, nil
+	return value, secretMountType, nil
 }
