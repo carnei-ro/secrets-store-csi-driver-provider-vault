@@ -136,10 +136,7 @@ func (p *Provider) getMountInfo(secretPath string, token string) (string, string
 		return "", "", err
 	}
 
-	// Database
-	db := regexp.MustCompile(`/creds/.+$`)
-	if db.MatchString(secretPath) {
-		secretPath = regexp.MustCompile(`creds/.+$`).ReplaceAllString(secretPath, "$1")
+	if mount.Data[secretPath].Type != "" {
 		return mount.Data[secretPath].Type, mount.Data[secretPath].Options["version"], nil
 	}
 
@@ -153,7 +150,7 @@ func (p *Provider) getMountInfo(secretPath string, token string) (string, string
 	return "", "", fmt.Errorf("failed to get infos about secret path")
 }
 
-func generateSecretEndpoint(vaultAddress string, secretMountType string, secretMountVersion string, secretPath string, secretVersion string) (string, error) {
+func generateSecretEndpoint(vaultAddress string, secretMountType string, secretMountVersion string, secretPath string, secretName string, secretVersion string) (string, error) {
 	addr := ""
 	errMessage := fmt.Errorf("Only mount types KV/1, KV/2 and database are supported")
 	switch secretMountType {
@@ -178,7 +175,7 @@ func generateSecretEndpoint(vaultAddress string, secretMountType string, secretM
 			return "", fmt.Errorf("Unable to generate secret endpoint for KV")
 		}
 	case "database":
-		addr = vaultAddress + "/v1/" + secretPath
+		addr = vaultAddress + "/v1/" + normalizeSecretPath(secretPath) + "creds/" + secretName
 	default:
 		return "", errMessage
 	}
@@ -278,7 +275,7 @@ func (p *Provider) getSecret(token string, secretPath string, secretName string,
 		return "", err
 	}
 
-	addr, err := generateSecretEndpoint(p.VaultAddress, secretMountType, secretMountVersion, secretPath, secretVersion)
+	addr, err := generateSecretEndpoint(p.VaultAddress, secretMountType, secretMountVersion, secretPath, secretName, secretVersion)
 	if err != nil {
 		return "", err
 	}
@@ -334,9 +331,8 @@ func (p *Provider) getSecret(token string, secretPath string, secretName string,
 		if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
 			return "", errors.Wrapf(err, "failed to read body")
 		}
-		return d.Data[secretName], nil
+		return d.Data["username"]+"\n"+d.Data["password"], nil
 	}
-
 	return "", fmt.Errorf("failed to get secret value")
 }
 
